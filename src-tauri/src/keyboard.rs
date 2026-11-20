@@ -2,7 +2,7 @@ use crate::actions::ActionExecutor;
 use crate::types::*;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,29 +26,35 @@ const LLKHF_UP_FLAG: u32 = 0x00000080;
 static RAW_INPUT_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static LAST_HARDWARE_KEYBOARD: parking_lot::RwLock<Option<String>> = parking_lot::RwLock::new(None);
 static DETECTING_KEYBOARD: AtomicBool = AtomicBool::new(false);
-static DEVICE_HANDLE_CACHE: parking_lot::RwLock<Option<HashMap<isize, String>>> = parking_lot::RwLock::new(None);
 
-// ---- Deferred device attribution (fix for "first press goes through") ----
-// Raw Input "sink" events (sent when NumDeck is NOT the foreground app) arrive AFTER the
-// low-level hook has already run, so inside the hook we cannot know which keyboard produced
-// the key. Instead of guessing from the previous key, the hook parks matched deck keys here
-// (and suppresses them); once the WM_INPUT for the same key arrives we know the real device
-// and either run the deck action (target device) or re-inject the key (any other keyboard).
-const RI_KEY_BREAK_FLAG: u32 = 0x01;
-const RI_KEY_E0_FLAG: u32 = 0x02;
-const PENDING_EXPIRY_MS: u64 = 150;
+// ---- DIAGNOSTIC BUILD: logging only, behaviour is identical to v1.2.0 ----
+static DIAG_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
-static RAW_REGISTERED: AtomicBool = AtomicBool::new(false);
-static PENDING_KEYS: parking_lot::Mutex<VecDeque<PendingKey>> = parking_lot::Mutex::new(VecDeque::new());
-
-struct PendingKey {
-    key_id: String,
-    vk_code: u32,
-    scan_code: u32,
-    is_extended: bool,
-    is_key_down: bool,
-    queued_at: Instant,
+fn diag_us() -> u128 {
+    DIAG_START.get_or_init(Instant::now).elapsed().as_micros()
 }
+
+fn diag_send(tx: &Sender<WorkerMessage>, msg: String) {
+    let _ = tx.send(WorkerMessage::Telemetry(TelemetryRecord {
+        timestamp_ms: current_time_ms(),
+        fg_window: msg,
+        fg_pid: 0,
+        is_self_foreground: false,
+        vk_code: 0,
+        vk_name: "DIAG".to_string(),
+        scan_code: 0,
+        is_extended: false,
+        is_key_down: false,
+        is_injected: false,
+        numlock_on: false,
+        matched_logical_key: None,
+        deck_mode_enabled: false,
+        event_suppressed: false,
+        queued_action: None,
+        hook_duration_us: 0,
+    }));
+}
+static DEVICE_HANDLE_CACHE: parking_lot::RwLock<Option<HashMap<isize, String>>> = parking_lot::RwLock::new(None);
 
 /// Diagnostic telemetry record capturing all 12 requested fields
 #[derive(Debug, Clone)]
@@ -290,9 +296,8 @@ fn resolve_device_id_from_handle(hdevice: HANDLE) -> String {
     "UNKNOWN".to_string()
 }
 
-/// Process a WM_INPUT lParam, update the most recent hardware keyboard, trigger detection if active,
-/// and (when `resolve_pending` is true) resolve deck keys that were parked by the hook.
-fn process_raw_input_lparam(lparam: LPARAM, ctx: Option<&HookContext>, resolve_pending: bool) {
+/// Process a WM_INPUT lParam, update the most recent hardware keyboard, and trigger detection if active
+fn process_raw_input_lparam(lparam: LPARAM, worker_tx: Option<&Sender<WorkerMessage>>, src: &'static str) {
     unsafe {
         let mut size = std::mem::size_of::<RAWINPUT>() as u32;
         let mut raw: RAWINPUT = std::mem::zeroed();
@@ -306,165 +311,21 @@ fn process_raw_input_lparam(lparam: LPARAM, ctx: Option<&HookContext>, resolve_p
         if res != u32::MAX && raw.header.dwType == RIM_TYPEKEYBOARD {
             let dev_id = resolve_device_id_from_handle(raw.header.hDevice);
             *LAST_HARDWARE_KEYBOARD.write() = Some(dev_id.clone());
+            if let Some(tx) = worker_tx {
+                let kb = raw.data.keyboard;
+                diag_send(tx, format!(
+                    "DIAG RAW[{}] t={}us dev={} make=0x{:02X} flags={} vkey=0x{:02X}",
+                    src, diag_us(), dev_id, kb.MakeCode, kb.Flags, kb.VKey
+                ));
+            }
 
             if DETECTING_KEYBOARD.swap(false, Ordering::SeqCst) {
-                if let Some(c) = ctx {
-                    let _ = c.worker_tx.send(WorkerMessage::KeyboardDeviceDetected(dev_id.clone()));
-                }
-            }
-
-            if resolve_pending {
-                if let Some(c) = ctx {
-                    let kb = raw.data.keyboard;
-                    let flags = kb.Flags as u32;
-                    resolve_pending_key(
-                        c,
-                        &dev_id,
-                        kb.MakeCode as u32,
-                        (flags & RI_KEY_BREAK_FLAG) != 0,
-                        (flags & RI_KEY_E0_FLAG) != 0,
-                    );
+                if let Some(tx) = worker_tx {
+                    let _ = tx.send(WorkerMessage::KeyboardDeviceDetected(dev_id));
                 }
             }
         }
     }
-}
-
-/// Re-send a key that the hook suppressed but that turned out NOT to belong to the target device.
-/// The event is marked injected by Windows, so our hook lets it straight through.
-fn reinject_key(p: &PendingKey) {
-    unsafe {
-        let mut input: INPUT = std::mem::zeroed();
-        input.r#type = INPUT_KEYBOARD;
-        input.Anonymous.ki.wVk = p.vk_code as u16;
-        input.Anonymous.ki.wScan = p.scan_code as u16;
-        let mut flags = 0u32;
-        if p.is_extended {
-            flags |= KEYEVENTF_EXTENDEDKEY;
-        }
-        if !p.is_key_down {
-            flags |= KEYEVENTF_KEYUP;
-        }
-        input.Anonymous.ki.dwFlags = flags;
-        SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
-    }
-}
-
-/// Called for every keyboard WM_INPUT: pair it with the parked key it belongs to (if any).
-fn resolve_pending_key(ctx: &HookContext, dev_id: &str, make_code: u32, is_break: bool, is_e0: bool) {
-    let mut stale: Vec<PendingKey> = Vec::new();
-    let matched: Option<PendingKey>;
-    {
-        let mut q = PENDING_KEYS.lock();
-        let pos = q.iter().position(|p| {
-            p.scan_code == make_code && p.is_key_down == !is_break && p.is_extended == is_e0
-        });
-        if let Some(i) = pos {
-            // Anything parked before this one never got its raw event: let it through.
-            for _ in 0..i {
-                if let Some(old) = q.pop_front() {
-                    stale.push(old);
-                }
-            }
-            matched = q.pop_front();
-        } else {
-            matched = None;
-        }
-    }
-    for old in &stale {
-        reinject_key(old);
-    }
-    if let Some(p) = matched {
-        finish_pending_key(ctx, p, dev_id);
-    }
-}
-
-/// Safety net: if a parked key never gets its raw event, release it after a short time.
-fn flush_expired_pending() {
-    let mut expired: Vec<PendingKey> = Vec::new();
-    {
-        let mut q = PENDING_KEYS.lock();
-        while let Some(front) = q.front() {
-            if front.queued_at.elapsed() > Duration::from_millis(PENDING_EXPIRY_MS) {
-                if let Some(p) = q.pop_front() {
-                    expired.push(p);
-                }
-            } else {
-                break;
-            }
-        }
-    }
-    for p in &expired {
-        reinject_key(p);
-    }
-}
-
-/// The device is now known: run the deck action for the target keyboard, or pass the key on.
-fn finish_pending_key(ctx: &HookContext, p: PendingKey, dev_id: &str) {
-    let target_device = ctx.state.target_keyboard_device.read().clone();
-    let is_target = match target_device {
-        Some(ref target) if target != "all" && !target.is_empty() => {
-            dev_id.eq_ignore_ascii_case(target) || dev_id.contains(target.as_str())
-        }
-        _ => true,
-    };
-
-    if !is_target || *ctx.state.mode.read() != EngineMode::Deck {
-        reinject_key(&p);
-        return;
-    }
-
-    let mut queued_action_str = None;
-
-    if p.is_key_down {
-        let is_first_press = ctx.state.pressed_keys.write().insert(p.key_id.clone());
-        if is_first_press {
-            let profile = ctx.state.active_profile.read();
-            let active_folder = ctx.state.active_folder_id.read();
-            let assignment = if let Some(folder_id) = active_folder.as_ref() {
-                profile
-                    .folders
-                    .iter()
-                    .find(|f| f.id == *folder_id)
-                    .and_then(|f| f.keys.get(&p.key_id))
-                    .or_else(|| profile.keys.get(&p.key_id))
-            } else {
-                profile.keys.get(&p.key_id)
-            };
-            if let Some(assign) = assignment {
-                if let Some(action) = &assign.action {
-                    queued_action_str = Some(format!("{:?}", action));
-                    let _ = ctx.worker_tx.send(WorkerMessage::ExecuteAction {
-                        key_id: p.key_id.clone(),
-                        action: action.clone(),
-                    });
-                }
-            }
-        }
-    } else {
-        ctx.state.pressed_keys.write().remove(&p.key_id);
-    }
-
-    let (fg_window, fg_pid, is_self_foreground) = get_foreground_info();
-    let numlock_on = unsafe { (GetKeyState(VK_NUMLOCK as i32) & 1) != 0 };
-    let _ = ctx.worker_tx.send(WorkerMessage::Telemetry(TelemetryRecord {
-        timestamp_ms: current_time_ms(),
-        fg_window,
-        fg_pid,
-        is_self_foreground,
-        vk_code: p.vk_code,
-        vk_name: vk_code_to_name(p.vk_code),
-        scan_code: p.scan_code,
-        is_extended: p.is_extended,
-        is_key_down: p.is_key_down,
-        is_injected: false,
-        numlock_on,
-        matched_logical_key: Some(p.key_id.clone()),
-        deck_mode_enabled: true,
-        event_suppressed: true,
-        queued_action: queued_action_str,
-        hook_duration_us: 0,
-    }));
 }
 
 // Global static holder for hook context accessed by the Win32 C-callback
@@ -727,9 +588,6 @@ impl KeyboardEngine {
                 };
                 let reg_res = RegisterRawInputDevices(&rid, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
                 log::info!("Raw Input keyboard sink registered on HWND {:?}: success={}", raw_hwnd, reg_res != 0);
-                RAW_REGISTERED.store(reg_res != 0, Ordering::SeqCst);
-                // Periodic tick used only to release parked keys whose raw event never arrives
-                SetTimer(raw_hwnd, 1, 40, None);
             } else {
                 log::warn!("Failed to create HWND_MESSAGE for Raw Input sink: {}", GetLastError());
             }
@@ -757,17 +615,14 @@ impl KeyboardEngine {
             while GetMessageW(&mut msg, 0 as _, 0, 0) > 0 {
                 if msg.message == WM_INPUT {
                     let hook_guard = HOOK_DATA.read();
-                    process_raw_input_lparam(msg.lParam, hook_guard.as_ref(), true);
-                } else if msg.message == WM_TIMER {
-                    flush_expired_pending();
+                    let worker_tx = hook_guard.as_ref().map(|d| &d.worker_tx);
+                    process_raw_input_lparam(msg.lParam, worker_tx, "loop");
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
 
             log::info!("Unhooking WH_KEYBOARD_LL...");
-            RAW_REGISTERED.store(false, Ordering::SeqCst);
-            flush_expired_pending();
             UnhookWindowsHookEx(hook);
             if raw_hwnd != 0 as _ {
                 DestroyWindow(raw_hwnd);
@@ -856,6 +711,14 @@ unsafe extern "system" fn low_level_keyboard_proc(
         // Query foreground window info
         let (fg_window, fg_pid, is_self_foreground) = get_foreground_info();
 
+        {
+            let last_dev_dbg = LAST_HARDWARE_KEYBOARD.read().clone().unwrap_or_default();
+            diag_send(&hook_data.worker_tx, format!(
+                "DIAG HOOK t={}us vk=0x{:02X} scan=0x{:02X} down={} inj={} last_dev_on_entry={}",
+                diag_us(), vk_code, scan_code, is_key_down, is_injected, last_dev_dbg
+            ));
+        }
+
         if is_injected {
             // Synthetic input generated by our own SendInput; pass through immediately without delay
             let duration_us = hook_start.elapsed().as_micros() as u64;
@@ -903,11 +766,9 @@ unsafe extern "system" fn low_level_keyboard_proc(
         // Drain any pending Raw Input messages to update hardware device attribution
         let raw_hwnd = RAW_INPUT_HWND.load(Ordering::Relaxed) as HWND;
         if raw_hwnd != 0 as _ {
-            // PM_NOREMOVE: only refresh LAST_HARDWARE_KEYBOARD here; the message loop still
-            // receives the same WM_INPUT and resolves parked keys from there.
             let mut raw_msg: MSG = std::mem::zeroed();
-            if PeekMessageW(&mut raw_msg, raw_hwnd, WM_INPUT, WM_INPUT, PM_NOREMOVE) != 0 {
-                process_raw_input_lparam(raw_msg.lParam, Some(hook_data), false);
+            while PeekMessageW(&mut raw_msg, raw_hwnd, WM_INPUT, WM_INPUT, PM_REMOVE) != 0 {
+                process_raw_input_lparam(raw_msg.lParam, Some(&hook_data.worker_tx), "drain");
             }
         }
 
@@ -919,35 +780,6 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 let _ = hook_data.worker_tx.send(WorkerMessage::KeyboardDeviceDetected(current_dev));
             }
             return 1; // Suppress the detection keystroke
-        }
-
-        // Deferred device attribution: in Deck mode with a specific target keyboard, park matched keys
-        // (suppressed) until Raw Input tells us which keyboard they really came from.
-        if RAW_REGISTERED.load(Ordering::Relaxed) {
-            let target_device = hook_data.state.target_keyboard_device.read().clone();
-            let target_active = if let Some(ref target) = target_device {
-                target != "all" && !target.is_empty()
-            } else {
-                false
-            };
-            if target_active && *hook_data.state.mode.read() == EngineMode::Deck {
-                let matched_key = hook_data
-                    .state
-                    .calibration
-                    .read()
-                    .find_matched_key(vk_code, scan_code, is_extended);
-                if let Some(key_id) = matched_key {
-                    PENDING_KEYS.lock().push_back(PendingKey {
-                        key_id,
-                        vk_code,
-                        scan_code,
-                        is_extended,
-                        is_key_down,
-                        queued_at: Instant::now(),
-                    });
-                    return 1;
-                }
-            }
         }
 
         // Target device filter: If a specific keyboard is chosen, allow other keyboards to type freely
