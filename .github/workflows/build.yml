@@ -4,14 +4,24 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Interception driver files
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/oblitum/Interception/releases/download/v1.0.1/Interception.zip" -OutFile Interception.zip
+          Expand-Archive Interception.zip -DestinationPath interception
+          New-Item -ItemType Directory -Force -Path src-tauri/vendor | Out-Null
+          $dll = Get-ChildItem -Recurse interception -Filter interception.dll | Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+          $inst = Get-ChildItem -Recurse interception -Filter install-interception.exe | Select-Object -First 1
+          Copy-Item $dll.FullName src-tauri/vendor/interception.dll
+          Copy-Item $inst.FullName src-tauri/vendor/install-interception.exe
       - run: npm ci
       - run: npx @tauri-apps/cli build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: NumDeck-build
           path: |
