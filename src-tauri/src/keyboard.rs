@@ -3,6 +3,8 @@ use crate::types::*;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -27,21 +29,35 @@ static RAW_INPUT_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::nu
 static LAST_HARDWARE_KEYBOARD: parking_lot::RwLock<Option<String>> = parking_lot::RwLock::new(None);
 static DETECTING_KEYBOARD: AtomicBool = AtomicBool::new(false);
 
-// ---- DIAGNOSTIC BUILD: logging only, behaviour is identical to v1.2.0 ----
-static DIAG_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+// =====================================================================================
+// Built-in device tagger (Interception driver)
+// -------------------------------------------------------------------------------------
+// Windows only tells us which keyboard a key came from AFTER the low-level hook has already
+// decided what to do with it. The Interception driver sees the key earlier, so this thread
+// stamps every stroke of the selected (target) keyboard with NUMPAD_TAG_MAGIC. Windows hands
+// that value to the hook as dwExtraInfo, so the hook knows the device of the CURRENT key
+// immediately. If the driver is missing, NumDeck falls back to the old behaviour.
+// The files are embedded at build time (see the GitHub workflow that fills src-tauri/vendor).
+// =====================================================================================
+static INTERCEPTION_DLL: &[u8] = include_bytes!("../vendor/interception.dll");
+static INTERCEPTION_INSTALLER: &[u8] = include_bytes!("../vendor/install-interception.exe");
 
-fn diag_us() -> u128 {
-    DIAG_START.get_or_init(Instant::now).elapsed().as_micros()
+const NUMPAD_TAG_MAGIC: usize = 0x4E44_434B; // "NDCK"
+static TAGGER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// True while the tagger is running AND it can see the selected target keyboard.
+fn tagger_running() -> bool {
+    TAGGER_ACTIVE.load(Ordering::Relaxed)
 }
 
-fn diag_send(tx: &Sender<WorkerMessage>, msg: String) {
+fn tag_diag(tx: &Sender<WorkerMessage>, msg: String) {
     let _ = tx.send(WorkerMessage::Telemetry(TelemetryRecord {
         timestamp_ms: current_time_ms(),
         fg_window: msg,
         fg_pid: 0,
         is_self_foreground: false,
         vk_code: 0,
-        vk_name: "DIAG".to_string(),
+        vk_name: "TAGDIAG".to_string(),
         scan_code: 0,
         is_extended: false,
         is_key_down: false,
@@ -53,6 +69,317 @@ fn diag_send(tx: &Sender<WorkerMessage>, msg: String) {
         queued_action: None,
         hook_duration_us: 0,
     }));
+}
+
+type IcContext = *mut c_void;
+type IcPredicate = unsafe extern "C" fn(i32) -> i32;
+type FnCreate = unsafe extern "C" fn() -> IcContext;
+type FnSetFilter = unsafe extern "C" fn(IcContext, Option<IcPredicate>, u16);
+type FnWaitTimeout = unsafe extern "C" fn(IcContext, u32) -> i32;
+type FnReceive = unsafe extern "C" fn(IcContext, i32, *mut c_void, u32) -> i32;
+type FnSend = unsafe extern "C" fn(IcContext, i32, *const c_void, u32) -> i32;
+type FnGetHwid = unsafe extern "C" fn(IcContext, i32, *mut c_void, u32) -> u32;
+
+#[repr(C)]
+struct IcKeyStroke {
+    code: u16,
+    state: u16,
+    information: u32,
+}
+
+struct IcApi {
+    create: FnCreate,
+    set_filter: FnSetFilter,
+    wait: FnWaitTimeout,
+    receive: FnReceive,
+    send: FnSend,
+    get_hwid: FnGetHwid,
+    is_keyboard: IcPredicate,
+}
+
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn ic_sym<T: Copy>(module: HMODULE, name: &[u8]) -> Option<T> {
+    unsafe {
+        let p = windows_sys::Win32::System::LibraryLoader::GetProcAddress(module, name.as_ptr());
+        p.map(|f| std::mem::transmute_copy::<_, T>(&f))
+    }
+}
+
+fn load_ic_api(dll_path: &std::path::Path) -> Option<IcApi> {
+    let wide: Vec<u16> = dll_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let module = unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
+    if module.is_null() {
+        return None;
+    }
+    Some(IcApi {
+        create: ic_sym(module, b"interception_create_context\0")?,
+        set_filter: ic_sym(module, b"interception_set_filter\0")?,
+        wait: ic_sym(module, b"interception_wait_with_timeout\0")?,
+        receive: ic_sym(module, b"interception_receive\0")?,
+        send: ic_sym(module, b"interception_send\0")?,
+        get_hwid: ic_sym(module, b"interception_get_hardware_id\0")?,
+        is_keyboard: ic_sym(module, b"interception_is_keyboard\0")?,
+    })
+}
+
+/// Hardware id of an Interception device as upper-case ASCII, strings separated by '|'
+fn ic_hwid_ascii(api: &IcApi, ctx: IcContext, dev: i32) -> String {
+    let mut buf = [0u8; 1024];
+    let n = unsafe { (api.get_hwid)(ctx, dev, buf.as_mut_ptr() as *mut c_void, (buf.len() - 4) as u32) } as usize;
+    if n == 0 || n > buf.len() - 4 {
+        return String::new();
+    }
+    let wide = n >= 4 && buf[1] == 0 && buf[3] == 0;
+    let mut out = String::new();
+    if wide {
+        let mut i = 0;
+        while i + 1 < n {
+            let c = u16::from(buf[i]) | (u16::from(buf[i + 1]) << 8);
+            if c == 0 {
+                out.push('|');
+            } else if c < 128 {
+                out.push((c as u8 as char).to_ascii_uppercase());
+            } else {
+                out.push('?');
+            }
+            i += 2;
+        }
+    } else {
+        for &b in &buf[..n] {
+            if b == 0 {
+                out.push('|');
+            } else {
+                out.push((b as char).to_ascii_uppercase());
+            }
+        }
+    }
+    out
+}
+
+/// Writes the embedded driver files to %APPDATA%\NumpadDeck\interception and returns that folder.
+fn extract_interception_files() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    let dir = std::path::PathBuf::from(base).join("NumpadDeck").join("interception");
+    std::fs::create_dir_all(&dir).ok()?;
+    let files: [(&str, &[u8]); 2] = [
+        ("interception.dll", INTERCEPTION_DLL),
+        ("install-interception.exe", INTERCEPTION_INSTALLER),
+    ];
+    for (name, bytes) in files {
+        let path = dir.join(name);
+        let up_to_date = std::fs::metadata(&path).map(|m| m.len() == bytes.len() as u64).unwrap_or(false);
+        if !up_to_date {
+            std::fs::write(&path, bytes).ok()?;
+        }
+    }
+    Some(dir)
+}
+
+/// Small dialog with a "don't show again" checkbox. Built with PowerShell + WinForms, the same
+/// approach NumDeck already uses for its file dialogs. Returns Some((install_now, dont_show_again)),
+/// or None if the dialog could not be shown.
+fn ask_driver_install_dialog() -> Option<(bool, bool)> {
+    use std::os::windows::process::CommandExt;
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$f = New-Object System.Windows.Forms.Form
+$f.Text = 'NumDeck'
+$f.StartPosition = 'CenterScreen'
+$f.FormBorderStyle = 'FixedDialog'
+$f.MaximizeBox = $false
+$f.MinimizeBox = $false
+$f.TopMost = $true
+$f.ClientSize = New-Object System.Drawing.Size(480, 230)
+$l = New-Object System.Windows.Forms.Label
+$l.RightToLeft = 'Yes'
+$l.Text = "عشان النام باد الخارجية تتعرف من أول ضغطة، NumDeck محتاج يثبّت برنامج صغير اسمه Interception.`n`nهيطلب إذن المدير مرة واحدة، وبعدها لازم تعمل ريستارت للجهاز مرة واحدة.`n`nتثبّته دلوقتي؟"
+$l.SetBounds(16, 14, 448, 120)
+$c = New-Object System.Windows.Forms.CheckBox
+$c.RightToLeft = 'Yes'
+$c.Text = 'ما تظهرش الرسالة دي تاني'
+$c.SetBounds(16, 140, 448, 28)
+$y = New-Object System.Windows.Forms.Button
+$y.Text = 'تثبيت الآن'
+$y.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+$y.SetBounds(250, 182, 100, 34)
+$n = New-Object System.Windows.Forms.Button
+$n.Text = 'مش دلوقتي'
+$n.DialogResult = [System.Windows.Forms.DialogResult]::No
+$n.SetBounds(360, 182, 104, 34)
+$f.AcceptButton = $y
+$f.CancelButton = $n
+$f.Controls.AddRange(@($l, $c, $y, $n))
+$r = $f.ShowDialog()
+Write-Output ("RESULT|{0}|{1}" -f $r, $c.Checked)
+"#;
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let line = text.lines().find(|l| l.trim_start().starts_with("RESULT|"))?;
+    let parts: Vec<&str> = line.trim().split('|').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    Some((parts[1].trim() == "Yes", parts[2].trim() == "True"))
+}
+
+/// The driver is not installed: ask (unless the user ticked "don't show again"), then install with an
+/// administrator prompt (no command line needed).
+fn offer_driver_install(dir: &std::path::Path) {
+    let marker = dir.join("install_declined.txt");
+    if marker.exists() {
+        return;
+    }
+    let title = wide_z("NumDeck");
+    let (install, dont_show_again) = match ask_driver_install_dialog() {
+        Some(r) => r,
+        None => {
+            // PowerShell dialog unavailable: plain Yes/No message box instead
+            let text = wide_z(
+                "عشان النام باد الخارجية تتعرف من أول ضغطة، NumDeck محتاج يثبّت برنامج صغير (Interception).\n\nهيطلب إذن المدير مرة واحدة، وبعدها لازم تعمل ريستارت للجهاز.\n\nتثبّته دلوقتي؟",
+            );
+            let answer = unsafe {
+                MessageBoxW(
+                    std::ptr::null_mut(),
+                    text.as_ptr(),
+                    title.as_ptr(),
+                    MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+                )
+            };
+            (answer == IDYES, false)
+        }
+    };
+    if dont_show_again {
+        let _ = std::fs::write(&marker, b"declined");
+    }
+    if install {
+        let exe = dir.join("install-interception.exe");
+        let verb = wide_z("runas");
+        let file = wide_z(&exe.to_string_lossy());
+        let args = wide_z("/install");
+        let workdir = wide_z(&dir.to_string_lossy());
+        unsafe {
+            windows_sys::Win32::UI::Shell::ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                args.as_ptr(),
+                workdir.as_ptr(),
+                SW_HIDE,
+            );
+        }
+        thread::sleep(Duration::from_secs(5));
+        let done = wide_z(
+            "لو وافقت على طلب إذن المدير، اعمل ريستارت للجهاز مرة واحدة عشان التثبيت يكتمل. بعدها NumDeck هيستخدم الدرايفر لوحده.",
+        );
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                done.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+            );
+        }
+    }
+}
+
+fn selected_target(state: &Arc<KeyboardEngineState>) -> Option<String> {
+    let target = state.target_keyboard_device.read().clone();
+    match target {
+        Some(t) if t != "all" && !t.is_empty() => Some(t.to_uppercase()),
+        _ => None,
+    }
+}
+
+fn tagger_thread(state: Arc<KeyboardEngineState>) {
+    // Nothing to do until a specific keyboard is selected in NumDeck
+    let mut target = loop {
+        if let Some(t) = selected_target(&state) {
+            break t;
+        }
+        thread::sleep(Duration::from_secs(3));
+    };
+
+    let dir = match extract_interception_files() {
+        Some(d) => d,
+        None => {
+            log::warn!("tagger: could not extract driver files");
+            return;
+        }
+    };
+    let api = match load_ic_api(&dir.join("interception.dll")) {
+        Some(a) => a,
+        None => {
+            log::warn!("tagger: could not load interception.dll");
+            return;
+        }
+    };
+    let ctx = unsafe { (api.create)() };
+    if ctx.is_null() {
+        log::warn!("tagger: Interception driver not installed (or Windows not restarted yet)");
+        offer_driver_install(&dir);
+        return;
+    }
+    unsafe {
+        (api.set_filter)(ctx, Some(api.is_keyboard), 0xFFFF);
+    }
+    log::info!("tagger: Interception driver ready");
+
+    let mut is_target = [false; 21];
+    let mut last_scan: Option<Instant> = None;
+    let mut stroke = [0u64; 16]; // large enough for any Interception stroke, 8-byte aligned
+
+    loop {
+        // Re-scan the devices about once per second (also picks up plugging/unplugging and target changes)
+        let scan_due = match last_scan {
+            Some(t) => t.elapsed() >= Duration::from_secs(1),
+            None => true,
+        };
+        if scan_due {
+            last_scan = Some(Instant::now());
+            match selected_target(&state) {
+                Some(t) => target = t,
+                None => target.clear(),
+            }
+            let mut any = false;
+            for dev in 1..=10i32 {
+                let matched = if target.is_empty() {
+                    false
+                } else {
+                    ic_hwid_ascii(&api, ctx, dev).contains(target.as_str())
+                };
+                is_target[dev as usize] = matched;
+                any |= matched;
+            }
+            TAGGER_ACTIVE.store(any, Ordering::Relaxed);
+        }
+
+        let dev = unsafe { (api.wait)(ctx, 1000) };
+        if dev <= 0 {
+            continue;
+        }
+        let received = unsafe { (api.receive)(ctx, dev, stroke.as_mut_ptr() as *mut c_void, 1) };
+        if received <= 0 {
+            continue;
+        }
+        if (1..=10).contains(&dev) && is_target[dev as usize] {
+            let ks = stroke.as_mut_ptr() as *mut IcKeyStroke;
+            unsafe {
+                (*ks).information = NUMPAD_TAG_MAGIC as u32;
+            }
+        }
+        unsafe {
+            (api.send)(ctx, dev, stroke.as_ptr() as *const c_void, 1);
+        }
+    }
 }
 static DEVICE_HANDLE_CACHE: parking_lot::RwLock<Option<HashMap<isize, String>>> = parking_lot::RwLock::new(None);
 
@@ -297,7 +624,7 @@ fn resolve_device_id_from_handle(hdevice: HANDLE) -> String {
 }
 
 /// Process a WM_INPUT lParam, update the most recent hardware keyboard, and trigger detection if active
-fn process_raw_input_lparam(lparam: LPARAM, worker_tx: Option<&Sender<WorkerMessage>>, src: &'static str) {
+fn process_raw_input_lparam(lparam: LPARAM, worker_tx: Option<&Sender<WorkerMessage>>) {
     unsafe {
         let mut size = std::mem::size_of::<RAWINPUT>() as u32;
         let mut raw: RAWINPUT = std::mem::zeroed();
@@ -310,14 +637,11 @@ fn process_raw_input_lparam(lparam: LPARAM, worker_tx: Option<&Sender<WorkerMess
         );
         if res != u32::MAX && raw.header.dwType == RIM_TYPEKEYBOARD {
             let dev_id = resolve_device_id_from_handle(raw.header.hDevice);
-            *LAST_HARDWARE_KEYBOARD.write() = Some(dev_id.clone());
-            if let Some(tx) = worker_tx {
-                let kb = raw.data.keyboard;
-                diag_send(tx, format!(
-                    "DIAG RAW[{}] t={}us dev={} make=0x{:02X} flags={} vkey=0x{:02X}",
-                    src, diag_us(), dev_id, kb.MakeCode, kb.Flags, kb.VKey
-                ));
+            // Keys injected by NumDeck itself arrive as "SYNTHETIC"; they must not overwrite the last REAL keyboard.
+            if dev_id == "SYNTHETIC" {
+                return;
             }
+            *LAST_HARDWARE_KEYBOARD.write() = Some(dev_id.clone());
 
             if DETECTING_KEYBOARD.swap(false, Ordering::SeqCst) {
                 if let Some(tx) = worker_tx {
@@ -383,6 +707,14 @@ impl KeyboardEngine {
                 Self::hook_thread_loop(thread_id_clone);
             })
             .expect("Failed to spawn hook thread");
+
+        // 4. Built-in device tagger (Interception driver); stays idle if the driver is not available
+        let tagger_state = Arc::clone(&state);
+        let _ = thread::Builder::new()
+            .name("numdeck-tagger".to_string())
+            .spawn(move || {
+                tagger_thread(tagger_state);
+            });
 
         Self {
             state,
@@ -616,7 +948,7 @@ impl KeyboardEngine {
                 if msg.message == WM_INPUT {
                     let hook_guard = HOOK_DATA.read();
                     let worker_tx = hook_guard.as_ref().map(|d| &d.worker_tx);
-                    process_raw_input_lparam(msg.lParam, worker_tx, "loop");
+                    process_raw_input_lparam(msg.lParam, worker_tx);
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -711,14 +1043,6 @@ unsafe extern "system" fn low_level_keyboard_proc(
         // Query foreground window info
         let (fg_window, fg_pid, is_self_foreground) = get_foreground_info();
 
-        {
-            let last_dev_dbg = LAST_HARDWARE_KEYBOARD.read().clone().unwrap_or_default();
-            diag_send(&hook_data.worker_tx, format!(
-                "DIAG HOOK t={}us vk=0x{:02X} scan=0x{:02X} down={} inj={} last_dev_on_entry={}",
-                diag_us(), vk_code, scan_code, is_key_down, is_injected, last_dev_dbg
-            ));
-        }
-
         if is_injected {
             // Synthetic input generated by our own SendInput; pass through immediately without delay
             let duration_us = hook_start.elapsed().as_micros() as u64;
@@ -768,7 +1092,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
         if raw_hwnd != 0 as _ {
             let mut raw_msg: MSG = std::mem::zeroed();
             while PeekMessageW(&mut raw_msg, raw_hwnd, WM_INPUT, WM_INPUT, PM_REMOVE) != 0 {
-                process_raw_input_lparam(raw_msg.lParam, Some(&hook_data.worker_tx), "drain");
+                process_raw_input_lparam(raw_msg.lParam, Some(&hook_data.worker_tx));
             }
         }
 
@@ -787,8 +1111,46 @@ unsafe extern "system" fn low_level_keyboard_proc(
         if let Some(ref target) = target_device {
             if target != "all" && !target.is_empty() {
                 let current_dev = LAST_HARDWARE_KEYBOARD.read().clone().unwrap_or_default();
-                // If device is known and DOES NOT match target, pass through to Windows immediately
-                if !current_dev.is_empty() && !current_dev.eq_ignore_ascii_case(target) && !current_dev.contains(target) {
+                let tagger_on = tagger_running();
+                let tagged = (kbd.dwExtraInfo as usize) == NUMPAD_TAG_MAGIC;
+                if tagger_on && is_key_down {
+                    tag_diag(
+                        &hook_data.worker_tx,
+                        format!(
+                            "TAGDIAG extra=0x{:X} vk=0x{:02X} scan=0x{:02X} tagged={}",
+                            kbd.dwExtraInfo as usize, vk_code, scan_code, tagged
+                        ),
+                    );
+                }
+                // Legacy mode only: a key-up whose key-down we already took over stays paired with it
+                let up_of_suppressed_down = if !is_key_down {
+                    let matched_up = hook_data
+                        .state
+                        .calibration
+                        .read()
+                        .find_matched_key(vk_code, scan_code, is_extended);
+                    match matched_up {
+                        Some(k) => {
+                            let held = hook_data.state.pressed_keys.read().contains(&k);
+                            held
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                let device_mismatch = if tagger_on {
+                    // Tagger active: an untagged key is NOT from the external numpad (certain, no guessing)
+                    !tagged
+                } else {
+                    // Legacy: guess from the previous key's device
+                    !up_of_suppressed_down
+                        && !current_dev.is_empty()
+                        && !current_dev.eq_ignore_ascii_case(target)
+                        && !current_dev.contains(target)
+                };
+                // If the key does NOT come from the target device, pass through to Windows immediately
+                if device_mismatch {
                     let duration_us = hook_start.elapsed().as_micros() as u64;
                     let _ = hook_data.worker_tx.send(WorkerMessage::Telemetry(TelemetryRecord {
                         timestamp_ms: current_time_ms(),
