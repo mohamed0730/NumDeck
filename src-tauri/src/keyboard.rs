@@ -178,116 +178,44 @@ fn extract_interception_files() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// Small dialog with a "don't show again" checkbox. Built with PowerShell + WinForms, the same
-/// approach NumDeck already uses for its file dialogs. Returns Some((install_now, dont_show_again)),
-/// or None if the dialog could not be shown.
-fn ask_driver_install_dialog() -> Option<(bool, bool)> {
-    use std::os::windows::process::CommandExt;
-    let script = r#"
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-[System.Windows.Forms.Application]::EnableVisualStyles()
-$f = New-Object System.Windows.Forms.Form
-$f.Text = 'NumDeck'
-$f.StartPosition = 'CenterScreen'
-$f.FormBorderStyle = 'FixedDialog'
-$f.MaximizeBox = $false
-$f.MinimizeBox = $false
-$f.TopMost = $true
-$f.ClientSize = New-Object System.Drawing.Size(480, 230)
-$l = New-Object System.Windows.Forms.Label
-$l.RightToLeft = 'Yes'
-$l.Text = "عشان النام باد الخارجية تتعرف من أول ضغطة، NumDeck محتاج يثبّت برنامج صغير اسمه Interception.`n`nهيطلب إذن المدير مرة واحدة، وبعدها لازم تعمل ريستارت للجهاز مرة واحدة.`n`nتثبّته دلوقتي؟"
-$l.SetBounds(16, 14, 448, 120)
-$c = New-Object System.Windows.Forms.CheckBox
-$c.RightToLeft = 'Yes'
-$c.Text = 'ما تظهرش الرسالة دي تاني'
-$c.SetBounds(16, 140, 448, 28)
-$y = New-Object System.Windows.Forms.Button
-$y.Text = 'تثبيت الآن'
-$y.DialogResult = [System.Windows.Forms.DialogResult]::Yes
-$y.SetBounds(250, 182, 100, 34)
-$n = New-Object System.Windows.Forms.Button
-$n.Text = 'مش دلوقتي'
-$n.DialogResult = [System.Windows.Forms.DialogResult]::No
-$n.SetBounds(360, 182, 104, 34)
-$f.AcceptButton = $y
-$f.CancelButton = $n
-$f.Controls.AddRange(@($l, $c, $y, $n))
-$r = $f.ShowDialog()
-Write-Output ("RESULT|{0}|{1}" -f $r, $c.Checked)
-"#;
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
-    let line = text.lines().find(|l| l.trim_start().starts_with("RESULT|"))?;
-    let parts: Vec<&str> = line.trim().split('|').collect();
-    if parts.len() < 3 {
-        return None;
-    }
-    Some((parts[1].trim() == "Yes", parts[2].trim() == "True"))
-}
-
-/// The driver is not installed: ask (unless the user ticked "don't show again"), then install with an
-/// administrator prompt (no command line needed).
-fn offer_driver_install(dir: &std::path::Path) {
-    let marker = dir.join("install_declined.txt");
+/// The driver is not installed: install it automatically, ONCE (Windows shows its own administrator
+/// prompt; that cannot be skipped). A short note then tells the user to restart Windows.
+/// Delete %APPDATA%\NumpadDeck\interception\install_attempted.txt to let NumDeck try again.
+fn install_driver_automatically(dir: &std::path::Path) {
+    let marker = dir.join("install_attempted.txt");
     if marker.exists() {
         return;
     }
-    let title = wide_z("NumDeck");
-    let (install, dont_show_again) = match ask_driver_install_dialog() {
-        Some(r) => r,
-        None => {
-            // PowerShell dialog unavailable: plain Yes/No message box instead
-            let text = wide_z(
-                "عشان النام باد الخارجية تتعرف من أول ضغطة، NumDeck محتاج يثبّت برنامج صغير (Interception).\n\nهيطلب إذن المدير مرة واحدة، وبعدها لازم تعمل ريستارت للجهاز.\n\nتثبّته دلوقتي؟",
-            );
-            let answer = unsafe {
-                MessageBoxW(
-                    std::ptr::null_mut(),
-                    text.as_ptr(),
-                    title.as_ptr(),
-                    MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
-                )
-            };
-            (answer == IDYES, false)
-        }
-    };
-    if dont_show_again {
-        let _ = std::fs::write(&marker, b"declined");
-    }
-    if install {
-        let exe = dir.join("install-interception.exe");
-        let verb = wide_z("runas");
-        let file = wide_z(&exe.to_string_lossy());
-        let args = wide_z("/install");
-        let workdir = wide_z(&dir.to_string_lossy());
-        unsafe {
-            windows_sys::Win32::UI::Shell::ShellExecuteW(
-                std::ptr::null_mut(),
-                verb.as_ptr(),
-                file.as_ptr(),
-                args.as_ptr(),
-                workdir.as_ptr(),
-                SW_HIDE,
-            );
-        }
-        thread::sleep(Duration::from_secs(5));
-        let done = wide_z(
-            "لو وافقت على طلب إذن المدير، اعمل ريستارت للجهاز مرة واحدة عشان التثبيت يكتمل. بعدها NumDeck هيستخدم الدرايفر لوحده.",
+    let _ = std::fs::write(&marker, b"attempted");
+
+    let exe = dir.join("install-interception.exe");
+    let verb = wide_z("runas");
+    let file = wide_z(&exe.to_string_lossy());
+    let args = wide_z("/install");
+    let workdir = wide_z(&dir.to_string_lossy());
+    unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            args.as_ptr(),
+            workdir.as_ptr(),
+            SW_HIDE,
         );
-        unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                done.as_ptr(),
-                title.as_ptr(),
-                MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
-            );
-        }
+    }
+    thread::sleep(Duration::from_secs(5));
+
+    let title = wide_z("NumDeck");
+    let text = wide_z(
+        "NumDeck بيجهّز العزل الفوري للنام باد الخارجية.\n\nلو وافقت على طلب إذن المدير اللي ظهر، اعمل ريستارت للجهاز مرة واحدة عشان يكتمل.\n\nالرسالة دي مش هتظهر تاني.",
+    );
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+        );
     }
 }
 
@@ -325,7 +253,7 @@ fn tagger_thread(state: Arc<KeyboardEngineState>) {
     let ctx = unsafe { (api.create)() };
     if ctx.is_null() {
         log::warn!("tagger: Interception driver not installed (or Windows not restarted yet)");
-        offer_driver_install(&dir);
+        install_driver_automatically(&dir);
         return;
     }
     unsafe {
