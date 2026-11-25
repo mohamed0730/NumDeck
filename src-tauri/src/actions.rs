@@ -36,7 +36,8 @@ impl ActionExecutor {
             ActionConfig::SwitchProfile { .. }
             | ActionConfig::NavigateFolder { .. }
             | ActionConfig::BackToRootFolder
-            | ActionConfig::ToggleDeckMode => Ok(()),
+            | ActionConfig::ToggleDeckMode
+            | ActionConfig::Passthrough => Ok(()),
         }
     }
 
